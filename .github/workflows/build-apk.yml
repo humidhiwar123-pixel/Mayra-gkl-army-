@@ -1,0 +1,124 @@
+name: Build Android APK (MYRA AI)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Select APK Build Type"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - "both"
+          - "debug"
+          - "release"
+
+jobs:
+  build:
+    name: Build & Package APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Restore Keystores & Environment
+        run: |
+          echo "=== Setting up keystores and environment files ==="
+          
+          # Restore debug.keystore from base64 if not already present
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            echo "Decoding debug.keystore from debug.keystore.base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+
+          # Prepare my-upload-key.jks for release signing if not present
+          if [ ! -f my-upload-key.jks ]; then
+            echo "Setting up fallback signing key for release..."
+            cp debug.keystore my-upload-key.jks
+          fi
+
+          # Setup .env file
+          if [ ! -f .env ]; then
+            echo "Creating .env from .env.example..."
+            cp .env.example .env
+          fi
+          
+          # Inject GEMINI_API_KEY from GitHub Secrets if available
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "Injecting GEMINI_API_KEY from repository secrets..."
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          fi
+
+          # Ensure gradlew has execute permissions
+          chmod +x gradlew
+
+      - name: Build Debug APK
+        if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == null }}
+        run: |
+          echo "=== Building Debug APK ==="
+          ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Build Release APK
+        if: ${{ github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == null }}
+        env:
+          STORE_PASSWORD: "android"
+          KEY_PASSWORD: "android"
+        run: |
+          echo "=== Building Release APK ==="
+          ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Organize Output APKs
+        run: |
+          mkdir -p release-apks
+          
+          if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp app/build/outputs/apk/debug/app-debug.apk release-apks/MYRA_AI_Debug.apk
+            echo "Debug APK ready: release-apks/MYRA_AI_Debug.apk"
+          fi
+          
+          if [ -f app/build/outputs/apk/release/app-release-unsigned.apk ]; then
+            cp app/build/outputs/apk/release/app-release-unsigned.apk release-apks/MYRA_AI_Release.apk
+            echo "Release APK ready: release-apks/MYRA_AI_Release.apk"
+          elif [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk release-apks/MYRA_AI_Release.apk
+            echo "Release APK ready: release-apks/MYRA_AI_Release.apk"
+          fi
+          
+          ls -la release-apks/
+
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MYRA-AI-APKs
+          path: release-apks/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release (On Tag Push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-apks/*.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
